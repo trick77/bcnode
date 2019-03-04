@@ -126,10 +126,10 @@ export class MiningOfficer {
     this._collectedBlocks[block.getBlockchain()] += 1
     this._logger.info('[] <- [] ' + 'rovered ' + block.getBlockchain() + ' block ' + block.getHeight() + ' ' + block.getHash())
     // TODO: Adjust minimum count of collected blocks needed to trigger mining
-    this._canMine = true
-    // if (!this._canMine && all((numCollected: number) => numCollected >= 1, values(this._collectedBlocks))) {
-    //   this._canMine = true
-    // }
+    //this._canMine = true
+    if (!this._canMine && all((numCollected: number) => numCollected >= 1, values(this._collectedBlocks))) {
+      this._canMine = true
+    }
 
     if (this._canMine === true && MIN_HEALTH_NET === false) {
       try {
