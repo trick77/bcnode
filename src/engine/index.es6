@@ -292,11 +292,11 @@ export class Engine {
       }
       let res = await this.persistence.put('rovers', roverNames)
       if (res) {
-        this._logger.info('stored rovers to persistence')
+        this._logger.debug('stored rovers to persistence')
       }
       res = await this.persistence.put('appversion', versionData)
       if (res) {
-        this._logger.info('stored appversion to persistence')
+        this._logger.debug('stored appversion to persistence')
       }
 
       if (BC_REMOVE_BTC === true) {
@@ -325,7 +325,7 @@ export class Engine {
       try {
         const latestBlock = await this.persistence.get('bc.block.latest')
         if (!latestBlock) {
-          this._logger.info(`Genesis block not found - assuming fresh DB and storing it`)
+          this._logger.warn(`Genesis block not found - assuming fresh DB and storing it`)
           throw new Error('Genesis not found - fallback to store it')
         }
         await this.multiverse.addNextBlock(latestBlock)
@@ -345,7 +345,7 @@ export class Engine {
           for (let output of txOutputs) {
             sumSoFar += parseInt(internalToHuman(output.getValue(), NRG))
           }
-          this._logger.info(`Set minted nrg: ${sumSoFar} in genesis block`)
+          this._logger.info(`set minted nrg: ${sumSoFar} in genesis block`)
           this.persistence.setNrgMintedSoFar(sumSoFar)
 
           await this.persistence.put('bc.block.latest', newGenesisBlock)
@@ -355,7 +355,7 @@ export class Engine {
           await this.persistence.put('bc.dht.quorum', 0)
           await this.persistence.put('bc.depth', 2)
           await this.multiverse.addNextBlock(newGenesisBlock)
-          this._logger.info('genesis block saved to disk ' + newGenesisBlock.getHash())
+          this._logger.debug('genesis block saved to disk ' + newGenesisBlock.getHash())
         } catch (e) {
           this._logger.error(`error while creating genesis block ${e.message}`)
           process.exit(1)
@@ -395,7 +395,7 @@ export class Engine {
           this.updateLatestAndStore(msg)
             .then((previousBlock) => {
               if (msg.mined === true) {
-                this._logger.info(`latest block ${msg.data.getHeight()} has been updated`)
+                this._logger.debug(`latest block ${msg.data.getHeight()} has been updated`)
               } else {
                 // this.miningOfficer.rebaseMiner()
                 // .then((state) => {
@@ -864,7 +864,7 @@ export class Engine {
           this.miningOfficer.newRoveredBlock(rovers, block, this._blockCache)
             .then((pid: number | false) => {
               if (pid !== false) {
-                this._logger.info(`collectBlock handler: sent to miner`)
+                debug(`collectBlock handler: sent to miner`)
               }
             })
             .catch(err => {
@@ -983,7 +983,7 @@ export class Engine {
 
     let boundariesToFetchPromise = Promise.resolve(false)
     if (BC_FETCH_MISSING_BLOCKS) {
-      debug(`getting missing blocks enabled ${BC_FETCH_MISSING_BLOCKS}`)
+      this._logger.info(`getting missing blocks enabled ${BC_FETCH_MISSING_BLOCKS}`)
       const headers = newBlock.getBlockchainHeaders()
       boundariesToFetchPromise = this.persistence.getBlockBoundariesToFetch(headers)
     }
@@ -1006,7 +1006,7 @@ export class Engine {
           }
           // Add block to LRU cache to avoid processing the same block twice
           this._logger.info(`Adding received ${fullBlock ? 'full ' : ''}block into cache of known blocks - ${newBlock.getHash()}`)
-          cache.set(newBlock.getHash(), true)
+          // cache.set(newBlock.getHash(), true)
           this._logger.info(`received new ${fullBlock ? 'full ' : ''}block from peer, height ${newBlock.getHeight()}`)
 
           if (fullBlock) {
@@ -1024,6 +1024,7 @@ export class Engine {
                 this._logger.info(`passing block to multiverse.AddBlock ${newBlock.getHeight()} : ${newBlock.getHash()} iph: ${iph} ipd: ${ipd}`)
                 this.multiverse.addBlock(newBlock)
                   .then(async ({ stored, needsResync }) => {
+                    this._logger.info(`stored: ${stored} ${newBlock.getHeight()}`)
                     this._logger.info(`new ${fullBlock ? 'full ' : ''}block ${stored ? 'NOT ' : ''}stored ${newBlock.getHeight()}`)
                     if (stored) {
                       const txs = newBlock.getTxsList()
@@ -1031,6 +1032,7 @@ export class Engine {
                       await this._txPendingPool.markTxsAsMined(txs, 'bc')
                       await this._unsettledTxManager.setMakerTxSettleEndsAtHeightIfNeeded(newBlock)
                       await this._unsettledTxManager.markTxAsSettledViaNewBlock(newBlock)
+
                       // update coinbase tx grant
                       let mintedNrgTotal = await this.persistence.getNrgMintedSoFar()
                       if (!mintedNrgTotal) {
@@ -1077,19 +1079,22 @@ export class Engine {
             const request = { dimension: 'hash', id: newBlock.getHash(), connection: conn }
             this._emitter.emit('getTxs', request)
             this.multiverse.addBlock(newBlock)
-              .then(({ stored, needsResync }) => {
+              .then(async ({ stored, needsResync }) => {
                 this._logger.info(`new ${fullBlock ? 'full ' : ''}block ${stored ? 'NOT ' : ''}stored ${newBlock.getHeight()}`)
                 // make sure IPH and IPD are complete before asking for sets to catch up
                 if (needsResync && iph === 'complete' && ipd === 'complete') {
                   this.persistence.get('bc.block.latest').then((latestBlock) => {
                     if (latestBlock !== null) {
+                      const diff = new BN(parseInt(newBlock.getHeight(), 10)).sub(new BN(parseInt(latestBlock.getHeight(), 10)).sub(new BN(1))).toNumber()
                       const getBlockListMessage = {
                         data: {
-                          high: newBlock.getHeight(),
-                          low: new BN(latestBlock.getHeight()).sub(new BN(12)).toNumber()
+                          high: parseInt(newBlock.getHeight(), 10),
+                          low: new BN(parseInt(newBlock.getHeight(), 10)).sub(new BN(diff)).toNumber()
                         },
                         connection: conn
                       }
+                      debug('get block list message')
+                      debug(getBlockListMessage)
                       this._emitter.emit('getblocklist', getBlockListMessage)
                     } else {
                       this._logger.error(new Error('critical error: unable to get bc.block.latest <- all super collider nodes will be vulnerable'))

@@ -56,7 +56,7 @@ const FRAMING_OPTS = {
   maxSize: _MAX_FRAME_SIZE
 }
 
-const { contains, find, isEmpty, max, min, merge, range, values } = require('ramda')
+const { contains, find, isEmpty, max, min, merge, values } = require('ramda')
 const { MESSAGES, MSG_SEPARATOR } = require('./protocol')
 const { encodeTypeAndData, encodeMessageToWire } = require('./codec')
 
@@ -343,47 +343,7 @@ export class PeerNode {
         await this.resetBlocksFrom(latestHeight)
         // if there are not enough peers left reset headers and try again
       } else if (ipd === 'running') {
-        //
-        // let latestHeightRaw = await this._engine.persistence.get('bc.data.latest')
-        // if (latestHeightRaw === null) {
-        //  await this._engine.persistence.put('bc.data.latest', 2)
-        //  latestHeightRaw = 2
-        // }
-        // const latestHeight = parseInt(latestHeightRaw, 10)
-        // const latestBlock = await this._engine.persistence.get('bc.block.latest')
-        // if (!latestBlock) {
-        //  this._logger.warn(`Couldn't get 'bc.block.latest' in processPeerEvaluations`)
-        //  return
-        // }
-        // const from = latestHeight
-        // const to = min(latestHeight + 500, latestHeight + parseInt(latestBlock.getHeight(), 10))
-        // debug(`ipd: ${ipd} with latest height from: ${from} to: ${to}`)
-        // const fromBlock = await this._engine.persistence.get(`bc.block.${from}`)
-        // const toBlock = await this._engine.persistence.get(`bc.block.${to}`)
-        // const payload = encodeTypeAndData(MESSAGES.GET_DATA, [fromBlock.getHash(), toBlock.getHash()])
-        // const conn = find(
-        //  ({ remoteAddress, remotePort }) => `${remoteAddress}:${remotePort}` === initialPeer.getAddress(),
-        //  this._discovery.connections
-        // )
-        // if (!conn) {
-        //  // unable to locate active connection
-        //  this._logger.warn(`unable to find given connection ${initialPeer.getAddress()}`)
-        //  // expire the peer and rerun processPeerEvaluations
-        //  initialPeer.setExpires(1)
-        //  await this._engine.persistence.put('bc.sync.initialpeer', initialPeer)
-        //  debug('unable to find connection -> requesting peer evaluations')
-        //  return this.processPeerEvaluations()
-        // } else {
-        //  // connection exists
-        //  debug('sending GET_DATA request to peer')
-        //  const result = await this.qsend(conn, payload)
-        //  if (result.success) {
-        //    this._logger.info('successful update sent to peer')
-        //  }
-        // }
-        // do not continue and evaluate the peer events -> return
-        // this assumes ipd is 'running'
-        // this assumes iph is 'complete'
+        debug('peer sync evalution stopped while ipd === running')
         return Promise.resolve(true)
       }
       // if there are less than 2 event pairs trigger resync
@@ -786,7 +746,8 @@ export class PeerNode {
       this._engine._emitter.on('getblocklist', (request) => {
         const { low, high } = request.data
         const payload = encodeTypeAndData(MESSAGES.GET_BLOCKS, [low, high])
-        this.qsend(request.connection, payload)
+        const c = request.connection || request.conn
+        this.qsend(c, payload)
       })
 
       // local <---- peer sent blocks
@@ -962,6 +923,8 @@ export class PeerNode {
         // reprocess peer evaluations if the peer response below minimum
         } else if (currentPeer !== null && Number(currentPeer.getExpires()) < Number(new Date())) {
           this._logger.info('peer headers above timestamp threshold')
+          await this._engine.persistence.put('bc.sync.initialpeerdata', 'pending')
+          await this._engine.persistence.put('bc.sync.initialpeerheader', 'running')
           await this.processPeerEvaluations()
           return
         }
@@ -1020,38 +983,21 @@ export class PeerNode {
         }
       // Peer Requests Block Range
       } else if (type === MESSAGES.GET_BLOCKS || type === MESSAGES.GET_MULTIVERSE) {
-        const address = conn.remoteAddress + ':' + conn.remotePort
-        debug(`received GET_BLOCKS request from peer ${address}`)
+        const latestBlock = await this._engine.persistence.get('bc.block.latest')
         const parts = bufferSplit(str, Buffer.from(MSG_SEPARATOR[type]))
         const low = parseInt(parts[1])
-        const high = parseInt(parts[2])
-        let outboundType = MESSAGES.BLOCKS
-        if (type === MESSAGES.GET_MULTIVERSE) {
-          outboundType = MESSAGES.MULTIVERSE
+        const from = max(2, parseInt(low, 10))
+        const to = min(parseInt(low, 10) + MAX_DATA_RANGE, parseInt(latestBlock.getHeight(), 10))
+        debug(`M.GET_BLOCKS: getting blocks from range from: ${from} -> ${to}`)
+        const blockList = await this._engine.persistence.getBlocksByRange(from, to, 'bc', { asBuffer: true })
+        if (!blockList || !Array.isArray(blockList)) {
+          this._logger.warn(`could not getBlocksByRange(${from}, ${to}) while handling GET_DATA message`)
+          return Promise.resolve(false)
         }
-        this._logger.info(`getblocklist handler: ${outboundType}, ${max(2, low)}, ${(high + 1)}`)
-        try {
-          const query = range(max(2, low), (high + 1)).map((n) => {
-            return 'bc.block.' + n
-          })
-          this._logger.info(query.length + ' blocks requested by peer: ' + conn.remoteAddress)
-          this._queue.push({ keys: query }, (err, blocks) => {
-            if (err) {
-              this._logger.warn(err)
-            } else {
-              const payload = encodeTypeAndData(outboundType, blocks)
-              this.qsend(conn, payload).then((res) => {
-                if (res.success && res.allSent) {
-                  this._logger.info('sent message of length: ' + payload.length)
-                }
-              })
-                .catch((err) => {
-                  this._logger.error(err)
-                })
-            }
-          })
-        } catch (err) {
-          this._logger.error(err)
+        const payload = encodeTypeAndData(MESSAGES.BLOCKS, blockList)
+        const result = await this.qsend(conn, payload)
+        if (result.success === true) {
+          this._logger.info('successful update sent to peer')
         }
       // Peer Sends Challenge Block
       } else if (type === '0011W01') { // TODO is this used / sent anywhere? if so add MESSAGES key
@@ -1285,10 +1231,10 @@ export class PeerNode {
       } else if (type === MESSAGES.GET_DATA) {
         const address = conn.remoteAddress + ':' + conn.remotePort
         debug(`M.GET_DATA received GET_DATA request from peer ${address}`)
+        const latestBlock = await this._engine.persistence.get('bc.block.latest')
         const parts = bufferSplit(str, Buffer.from(MSG_SEPARATOR[type]))
         const [, ...rawHeights] = parts
         const low = rawHeights[0]
-        const high = rawHeights[1]
         // const lowHashBlock = await this._engine.persistence.get('bc.block.' + low)
         // const highHashBlock = await this._engine.persistence.get('bc.block.' + high)
         // debug(`low: ${low}, high: ${high}`)
@@ -1309,7 +1255,7 @@ export class PeerNode {
         //  return Promise.resolve(false)
         // }
         const from = max(2, parseInt(low, 10))
-        const to = min(parseInt(low, 10) + MAX_DATA_RANGE, parseInt(high, 10))
+        const to = min(parseInt(low, 10) + MAX_DATA_RANGE, parseInt(latestBlock.getHeight(), 10))
         debug(`M.GET_DATA: getting tx data from range from: ${from} -> ${to}`)
         const blockList = await this._engine.persistence.getBlocksByRange(from, to, 'bc', { asBuffer: true })
         if (!blockList || !Array.isArray(blockList)) {
@@ -1362,9 +1308,10 @@ export class PeerNode {
           this._logger.warn(`cannot find 'bc.block.latest' while handling DATA message`)
           return false
         }
-        let syncComplete = false
         let validDataUpdate = true
         let currentHeight = 2
+        let highestBlock = false
+        let syncComplete = false
 
         for (let i = 0; i < blocks.length; i++) {
           const newBlock = BcBlock.deserializeBinary(blocks[i])
@@ -1374,7 +1321,13 @@ export class PeerNode {
           const block = await this._engine.persistence.get(`bc.block.${blockHeight}`)
           if (block === null || newBlock.getHash() !== block.getHash()) {
             // check if the peer simply sent more blocks
-            debug(`newBlock ${newBlock.getHeight()}:${newBlock.getHash()} vs loaded block ${block.getHeight()}:${block.getHash()}`)
+            if (block !== null && block !== undefined) {
+              debug(`newBlock ${newBlock.getHeight()}:${newBlock.getHash()} vs loaded block ${block.getHeight()}:${block.getHash()}`)
+            } else {
+              debug(`new block ${newBlock.getHeight()} is an update from peer`)
+              // validDateUpdate = false
+              continue
+            }
             // TODO add peer to deconnect list
             // if (newBlock.getHeight() < latestBlock.getHeight()) {
             //  debug(`newBlock ${newBlock.getHeight()} does not exist latestBlock ${latestBlock.getHeight()}`)
@@ -1383,17 +1336,23 @@ export class PeerNode {
             // }
           }
           // FIX: add block valid test
-          if (validDataUpdate === true) {
-            await this._engine.persistence.putBlock(newBlock)
-            if (newBlock.getHash() === latestBlock.getHash() || newBlock.getHeight() >= latestBlock.getHeight()) {
-              debug(`the sync is considered complete`)
-              syncComplete = true
+          if (validDataUpdate === true && newBlock !== undefined && newBlock !== null) {
+            const storedBlock = await this._engine.persistence.putBlock(newBlock)
+            debug(`storedBlock: ${storedBlock}`)
+            if (parseInt(newBlock.getHeight(), 10) >= parseInt(latestBlock.getHeight(), 10) && parseInt(latestBlock.getHeight(), 10) > currentHeight) {
+              await this._engine.persistence.put('bc.block.latest', newBlock)
             }
             // if valid set the new height
             if (currentHeight < newBlock.getHeight()) {
+              highestBlock = newBlock
               currentHeight = parseInt(newBlock.getHeight(), 10)
             }
           }
+        }
+
+        if (blocks.length < MAX_DATA_RANGE && parseInt(latestBlock.getHeight(), 10) === currentHeight) {
+          debug(`the sync is considered complete latestBlock: ${latestBlock.getHeight()} highestCurrent: ${currentHeight} blocks sent: ${blocks.length}`)
+          syncComplete = true
         }
 
         // if peer sends invalid data it is rejected and removed from the peer data
@@ -1411,7 +1370,6 @@ export class PeerNode {
           await this._engine.persistence.put('bc.data.latest', currentHeight)
           // TODO: request more blocks from the highest
           // get the current best block with data
-          const highestBlock = await this._engine.persistence.getBlockByHeight(currentHeight, 'bc', { asBuffer: true, asHeader: true })
           // get the current best block hash + MAX_DATA_RANGE
           const nextHeight = min(currentHeight + MAX_DATA_RANGE, currentHeight + parseInt(latestBlock.getHeight(), 10))
           debug(`requesting GET_DATA from highestLocalHeight: ${highestBlock.getHeight()} nextHeight for nextHighest: ${nextHeight}`)
@@ -1445,6 +1403,72 @@ export class PeerNode {
           }
         }
         // Peer Sends Block List 0007 // Peer Sends Multiverse 001
+      } else if (type === MESSAGES.BLOCKS) {
+        const address = conn.remoteAddress + ':' + conn.remotePort
+        debug(`received BLOCKS from peer ${address}`)
+        // TODO: blacklist functionality should go here to prevent peers from requesting large bandwidth multiple times
+        const parts = bufferSplit(str, Buffer.from(MSG_SEPARATOR[type]))
+        const [, ...blocks] = parts
+        const latestBlock = await this._engine.persistence.get('bc.block.latest')
+        const ipd = await this._engine.persistence.get('bc.sync.initialpeerdata')
+        currentPeer = await this._engine.persistence.get('bc.sync.initialpeer')
+        if (ipd !== 'running') {
+          this._logger.warn(`peer transmitted data running !== ${String(ipd)}`)
+          this._logger.warn(`peer transmitted data running !== ${String(ipd)}`)
+          this._logger.warn(`peer transmitted data running !== ${String(ipd)}`)
+          this._logger.warn(`peer transmitted data running !== ${String(ipd)}`)
+          return
+        }
+        if (!currentPeer) {
+          this._logger.warn(`cannot fetch currentPeer while handling DATA message`)
+          return false
+          // confirm peer is approved to be delivering data
+        } else if (currentPeer !== null && address !== currentPeer.getAddress()) {
+          this._logger.warn(`unapproved peer ${address} attempted data delivery`)
+          return
+        }
+        if (!latestBlock) {
+          this._logger.warn(`cannot find 'bc.block.latest' while handling DATA message`)
+          return false
+        }
+        let validDataUpdate = true
+        let currentHeight = 2
+
+        for (let i = 0; i < blocks.length; i++) {
+          const newBlock = BcBlock.deserializeBinary(blocks[i])
+          const blockHeight = newBlock.getHeight()
+          // if the block is not defined or corrupt reject the transmission
+          debug(`loading newBlock: ${blockHeight}`)
+          const block = await this._engine.persistence.get(`bc.block.${blockHeight}`)
+          if (block === null || newBlock.getHash() !== block.getHash()) {
+            // check if the peer simply sent more blocks
+            if (block !== null && block !== undefined) {
+              debug(`newBlock ${newBlock.getHeight()}:${newBlock.getHash()} vs loaded block ${block.getHeight()}:${block.getHash()}`)
+            } else {
+              debug(`new block ${newBlock.getHeight()} is an update from peer`)
+              // validDateUpdate = false
+              continue
+            }
+            // TODO add peer to deconnect list
+            // if (newBlock.getHeight() < latestBlock.getHeight()) {
+            //  debug(`newBlock ${newBlock.getHeight()} does not exist latestBlock ${latestBlock.getHeight()}`)
+            //  validDataUpdate = false
+            //  continue
+            // }
+          }
+          // FIX: add block valid test
+          if (validDataUpdate === true && newBlock !== undefined && newBlock !== null) {
+            const storedBlock = await this._engine.persistence.putBlock(newBlock)
+            debug(`storedBlock: ${storedBlock}`)
+            if (parseInt(newBlock.getHeight(), 10) >= parseInt(latestBlock.getHeight(), 10) && parseInt(latestBlock.getHeight(), 10) > currentHeight) {
+              await this._engine.persistence.put('bc.block.latest', newBlock)
+            }
+            // if valid set the new height
+            if (currentHeight < newBlock.getHeight()) {
+              currentHeight = parseInt(newBlock.getHeight(), 10)
+            }
+          }
+        }
       } else if (type === MESSAGES.BLOCKS || type === MESSAGES.MULTIVERSE) {
         const ipd = await this._engine.persistence.get('bc.sync.initialpeerdata')
         const address = conn.remoteAddress + ':' + conn.remotePort
